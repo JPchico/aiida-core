@@ -97,6 +97,7 @@ ENTRY_POINT_GROUP_FACTORY_MAPPING = {
     'aiida.groups': factories.GroupFactory,
     'aiida.parsers': factories.ParserFactory,
     'aiida.schedulers': factories.SchedulerFactory,
+    'aiida.storage': factories.StorageFactory,
     'aiida.transports': factories.TransportFactory,
     'aiida.tools.dbimporters': factories.DbImporterFactory,
     'aiida.tools.data.orbital': factories.OrbitalFactory,
@@ -161,8 +162,8 @@ def parse_entry_point_string(entry_point_string: str) -> Tuple[str, str]:
 
     try:
         group, name = entry_point_string.split(ENTRY_POINT_STRING_SEPARATOR)
-    except ValueError:
-        raise ValueError('invalid entry_point_string format')
+    except ValueError as exc:
+        raise ValueError(f'invalid entry_point_string format: {entry_point_string}') from exc
 
     return group, name
 
@@ -356,7 +357,7 @@ def get_entry_point_string_from_class(class_module: str, class_name: str) -> Opt
     group, entry_point = get_entry_point_from_class(class_module, class_name)
 
     if group and entry_point:
-        return ENTRY_POINT_STRING_SEPARATOR.join([group, entry_point.name])  # type: ignore[attr-defined]
+        return ENTRY_POINT_STRING_SEPARATOR.join([group, entry_point.name])
     return None
 
 

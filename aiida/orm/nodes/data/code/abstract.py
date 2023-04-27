@@ -12,16 +12,22 @@ from __future__ import annotations
 
 import abc
 import collections
+import pathlib
+from typing import TYPE_CHECKING
 
 import click
 
 from aiida.cmdline.params.options.interactive import TemplateInteractiveOption
 from aiida.common import exceptions
+from aiida.common.folders import Folder
 from aiida.common.lang import type_check
 from aiida.orm import Computer
 from aiida.plugins import CalculationFactory
 
 from ..data import Data
+
+if TYPE_CHECKING:
+    from aiida.engine import ProcessBuilder
 
 __all__ = ('AbstractCode',)
 
@@ -34,15 +40,19 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
     _KEY_ATTRIBUTE_APPEND_TEXT: str = 'append_text'
     _KEY_ATTRIBUTE_PREPEND_TEXT: str = 'prepend_text'
     _KEY_ATTRIBUTE_USE_DOUBLE_QUOTES: str = 'use_double_quotes'
+    _KEY_ATTRIBUTE_WITH_MPI: str = 'with_mpi'
+    _KEY_ATTRIBUTE_WRAP_CMDLINE_PARAMS: str = 'wrap_cmdline_params'
     _KEY_EXTRA_IS_HIDDEN: str = 'hidden'  # Should become ``is_hidden`` once ``Code`` is dropped
 
     def __init__(
         self,
-        default_calc_job_plugin: str = None,
+        default_calc_job_plugin: str | None = None,
         append_text: str = '',
         prepend_text: str = '',
         use_double_quotes: bool = False,
+        with_mpi: bool | None = None,
         is_hidden: bool = False,
+        wrap_cmdline_params: bool = False,
         **kwargs
     ):
         """Construct a new instance.
@@ -51,6 +61,9 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
         :param append_text: The text that should be appended to the run line in the job script.
         :param prepend_text: The text that should be prepended to the run line in the job script.
         :param use_double_quotes: Whether the command line invocation of this code should be escaped with double quotes.
+        :param with_mpi: Whether the command should be run as an MPI program.
+        :param wrap_cmdline_params: Whether to wrap the executable and all its command line parameters into quotes to
+            form a single string. This is required to enable support for Docker with the ``ContainerizedCode``.
         :param is_hidden: Whether the code is hidden.
         """
         super().__init__(**kwargs)
@@ -58,7 +71,8 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
         self.append_text = append_text
         self.prepend_text = prepend_text
         self.use_double_quotes = use_double_quotes
-        self.use_double_quotes = use_double_quotes
+        self.with_mpi = with_mpi
+        self.wrap_cmdline_params = wrap_cmdline_params
         self.is_hidden = is_hidden
 
     @abc.abstractmethod
@@ -70,10 +84,46 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
         """
 
     @abc.abstractmethod
-    def get_executable(self) -> str:
+    def get_executable(self) -> pathlib.PurePosixPath:
         """Return the executable that the submission script should execute to run the code.
 
         :return: The executable to be called in the submission script.
+        """
+
+    def get_executable_cmdline_params(self, cmdline_params: list[str] | None = None) -> list:
+        """Return the list of executable with its command line parameters.
+
+        :param cmdline_params: List of command line parameters provided by the ``CalcJob`` plugin.
+        :return: List of the executable followed by its command line parameters.
+        """
+        return [str(self.get_executable())] + (cmdline_params or [])
+
+    def get_prepend_cmdline_params( # pylint: disable=no-self-use
+        self,
+        mpi_args: list[str] | None = None,
+        extra_mpirun_params: list[str] | None = None
+    ) -> list[str]:
+        """Return List of command line parameters to be prepended to the executable in submission line.
+        These command line parameters are typically parameters related to MPI invocations.
+
+        :param mpi_args: List of MPI parameters provided by the ``Computer.get_mpirun_command`` method.
+        :param extra_mpiruns_params: List of MPI parameters provided by the ``metadata.options.extra_mpirun_params``
+            input of the ``CalcJob``.
+        :return: List of command line parameters to be prepended to the executable in submission line.
+        """
+        return (mpi_args or []) + (extra_mpirun_params or [])
+
+    def validate_working_directory(self, folder: Folder):
+        """Validate content of the working directory created by the :class:`~aiida.engine.CalcJob` plugin.
+
+        This method will be called by :meth:`~aiida.engine.processes.calcjobs.calcjob.CalcJob.presubmit` when a new
+        calculation job is launched, passing the :class:`~aiida.common.folders.Folder` that was used by the plugin used
+        for the calculation to create the input files for the working directory. This method can be overridden by
+        implementations of the ``AbstractCode`` class that need to validate the contents of that folder.
+
+        :param folder: A sandbox folder that the ``CalcJob`` plugin wrote input files to that will be copied to the
+            working directory for the corresponding calculation job instance.
+        :raises PluginInternalError: If the content of the sandbox folder is not valid.
         """
 
     @property
@@ -87,7 +137,15 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
         :return: The full label of the code.
         """
 
-    @Data.label.setter
+    @property
+    def label(self) -> str:
+        """Return the label.
+
+        :return: The label.
+        """
+        return self.backend_entity.label
+
+    @label.setter
     def label(self, value: str) -> None:
         """Set the label.
 
@@ -172,6 +230,43 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
         self.base.attributes.set(self._KEY_ATTRIBUTE_USE_DOUBLE_QUOTES, value)
 
     @property
+    def with_mpi(self) -> bool | None:
+        """Return whether the command should be run as an MPI program.
+
+        :return: ``True`` if the code should be run as an MPI program, ``False`` if it shouldn't, ``None`` if unknown.
+        """
+        return self.base.attributes.get(self._KEY_ATTRIBUTE_WITH_MPI, None)
+
+    @with_mpi.setter
+    def with_mpi(self, value: bool | None) -> None:
+        """Set whether the command should be run as an MPI program.
+
+        :param value: ``True`` if the code should be run as an MPI program, ``False`` if it shouldn't, ``None`` if
+            unknown.
+        """
+        type_check(value, bool, allow_none=True)
+        self.base.attributes.set(self._KEY_ATTRIBUTE_WITH_MPI, value)
+
+    @property
+    def wrap_cmdline_params(self) -> bool:
+        """Return whether all command line parameters should be wrapped with double quotes to form a single argument.
+
+        ..note:: This is required to support certain containerization technologies, such as Docker.
+
+        :return: ``True`` if command line parameters should be wrapped, ``False`` otherwise.
+        """
+        return self.base.attributes.get(self._KEY_ATTRIBUTE_WRAP_CMDLINE_PARAMS, False)
+
+    @wrap_cmdline_params.setter
+    def wrap_cmdline_params(self, value: bool) -> None:
+        """Set whether all command line parameters should be wrapped with double quotes to form a single argument.
+
+        :param value: ``True`` if command line parameters should be wrapped, ``False`` otherwise.
+        """
+        type_check(value, bool)
+        self.base.attributes.set(self._KEY_ATTRIBUTE_WRAP_CMDLINE_PARAMS, value)
+
+    @property
     def is_hidden(self) -> bool:
         """Return whether the code is hidden.
 
@@ -188,7 +283,7 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
         type_check(value, bool)
         self.base.extras.set(self._KEY_EXTRA_IS_HIDDEN, value)
 
-    def get_builder(self):
+    def get_builder(self) -> 'ProcessBuilder':
         """Create and return a new ``ProcessBuilder`` for the ``CalcJob`` class of the plugin configured for this code.
 
         The configured calculation plugin class is defined by the ``default_calc_job_plugin`` property.
@@ -209,7 +304,7 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
         except exceptions.EntryPointError:
             raise exceptions.EntryPointError(f'The calculation entry point `{entry_point}` could not be loaded')
 
-        builder = process_class.get_builder()
+        builder = process_class.get_builder()  # type: ignore
         builder.code = self
 
         return builder
@@ -240,6 +335,7 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
         """Return the CLI options that would allow to create an instance of this class."""
         return {
             'label': {
+                'short_name': '-L',
                 'required': True,
                 'type': click.STRING,
                 'prompt': 'Label',
@@ -247,14 +343,33 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
                 'callback': cls.cli_validate_label_uniqueness,
             },
             'description': {
+                'short_name': '-D',
                 'type': click.STRING,
                 'prompt': 'Description',
                 'help': 'Human-readable description of this code ideally including version and compilation environment.'
             },
             'default_calc_job_plugin': {
+                'short_name': '-P',
                 'type': click.STRING,
                 'prompt': 'Default `CalcJob` plugin',
                 'help': 'Entry point name of the default plugin (as listed in `verdi plugin list aiida.calculations`).'
+            },
+            'use_double_quotes': {
+                'is_flag': True,
+                'default': False,
+                'help': 'Whether the executable and arguments of the code in the submission script should be escaped '
+                'with single or double quotes.',
+                'prompt': 'Escape using double quotes',
+            },
+            'with_mpi': {
+                'is_flag': True,
+                'default': None,
+                'help': (
+                    'Whether the executable should be run as an MPI program. This option can be left unspecified '
+                    'in which case `None` will be set and it is left up to the calculation job plugin or inputs '
+                    'whether to run with MPI.'
+                ),
+                'prompt': 'Run with MPI',
             },
             'prepend_text': {
                 'cls': TemplateInteractiveOption,
@@ -277,12 +392,5 @@ class AbstractCode(Data, metaclass=abc.ABCMeta):
                 'header': 'APPEND_TEXT: if there is any bash commands that should be appended to the executable call '
                 'in all submit scripts for this code, type that between the equal signs below and save the file.',
                 'footer': 'All lines that start with `#=`: will be ignored.'
-            },
-            'use_double_quotes': {
-                'is_flag': True,
-                'default': False,
-                'help': 'Whether the executable and arguments of the code in the submission script should be escaped '
-                'with single or double quotes.',
-                'prompt': 'Escape using double quotes',
             },
         }
